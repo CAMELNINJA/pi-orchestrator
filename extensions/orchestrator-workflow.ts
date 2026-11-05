@@ -60,6 +60,7 @@ interface OrchestratorConfig {
   replaceFooter?: boolean;
   rexPanes?: boolean;
   subagentEnvAllow?: string[];
+  subagentExtensions?: string[];
 }
 
 interface AgentConfig {
@@ -310,6 +311,13 @@ function subagentEnv(allow: readonly string[] = []): NodeJS.ProcessEnv {
     env[name] = value;
   }
   return env;
+}
+
+// Extensions listed in "subagentExtensions" load into every subagent despite --no-extensions.
+// Entries are extension files or package directories; "~/" expands to the home directory.
+function subagentExtensionPaths(entries: readonly string[] = []): string[] {
+  const home = process.env.HOME ?? "";
+  return entries.map((entry) => (entry === "~" ? home : entry.startsWith("~/") ? path.join(home, entry.slice(2)) : entry));
 }
 
 // A model-supplied cwd must stay inside the project the orchestrator runs in.
@@ -577,6 +585,9 @@ function normalizeOrchestratorConfig(value: any): OrchestratorConfig {
   if (typeof value.rexPanes === "boolean") config.rexPanes = value.rexPanes;
   if (Array.isArray(value.subagentEnvAllow)) {
     config.subagentEnvAllow = value.subagentEnvAllow.filter((name: unknown): name is string => typeof name === "string" && name.length > 0);
+  }
+  if (Array.isArray(value.subagentExtensions)) {
+    config.subagentExtensions = value.subagentExtensions.filter((entry: unknown): entry is string => typeof entry === "string" && entry.length > 0);
   }
   return config;
 }
@@ -1019,8 +1030,10 @@ async function runDelegatedAgent(
   onUsageDelta: ((delta: UsageDelta) => void) | undefined,
   providedSessionId?: string,
   thinkingOverride?: ThinkingLevel,
+  parentSessionId?: string,
 ): Promise<AgentToolResult<DelegationDetails>> {
   const agent = loadAgent(agentName);
+  const orchestratorConfig = loadOrchestratorConfig();
   const sessionDir = path.join(getAgentDir(), "subagent-sessions");
   const effectiveThinking = thinkingOverride ?? agent.thinking;
 
@@ -1085,6 +1098,11 @@ async function runDelegatedAgent(
 
   if (agent.tools.length > 0) {
     args.push("--tools", agent.tools.join(","));
+  }
+
+  // --no-extensions still loads explicit -e paths, so only the listed extensions ride into the child.
+  for (const extension of subagentExtensionPaths(orchestratorConfig.subagentExtensions)) {
+    args.push("-e", extension);
   }
 
   args.push(`Task from orchestrator:\n\n${task}`);
@@ -1277,7 +1295,9 @@ async function runDelegatedAgent(
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
       env: {
-        ...subagentEnv(loadOrchestratorConfig().subagentEnvAllow),
+        ...subagentEnv(orchestratorConfig.subagentEnvAllow),
+        // Lets a permission extension in the child forward its asks to the orchestrator's UI.
+        ...(parentSessionId ? { PI_SUBAGENT_PARENT_SESSION: parentSessionId } : {}),
         PI_TELEMETRY: process.env.PI_TELEMETRY || "0",
         PI_SKIP_VERSION_CHECK: process.env.PI_SKIP_VERSION_CHECK || "1",
         PI_CACHE_RETENTION: process.env.PI_CACHE_RETENTION || "long",
@@ -2530,6 +2550,7 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
         (delta) => recordUsageDelta(role, delta, ctx),
         params.sessionId,
         params.thinking as ThinkingLevel | undefined,
+        ctx.sessionManager?.getSessionId?.(),
       );
       refreshStatusWidget(ctx, true);
       return result;

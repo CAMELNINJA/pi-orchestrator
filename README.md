@@ -70,6 +70,18 @@ When Pi runs inside a [Rex](https://www.superlogical.com/rex) terminal (`REX_SES
 - Logs are kept at `~/.pi/agent/subagent-sessions/rex/<session id>.log`, readable only by you.
 - The `rex` command must be on `PATH`. Outside Rex, or if `rex` fails, delegations run exactly as before.
 
+## Extensions in subagents
+
+Subagents start with `--no-extensions`, so extensions you installed run only in the orchestrator. To load specific ones into every subagent, list their files or package directories in `subagentExtensions` in `~/.pi/agent/orchestrator-config.json` (`~/` is expanded):
+
+```json
+{
+  "subagentExtensions": ["~/.pi/agent/npm/node_modules/@gotgenes/pi-permission-system"]
+}
+```
+
+Each subagent also gets `PI_SUBAGENT_PARENT_SESSION` set to the orchestrator's session id. With [`@gotgenes/pi-permission-system`](https://www.npmjs.com/package/@gotgenes/pi-permission-system) loaded this way, a subagent's `ask` decisions, such as a `bash` command, are forwarded to the orchestrator's window for you to approve instead of running unchecked.
+
 ## Reliability
 
 Delegation session resume resolves the exact subagent session file, so resuming works across different cwds. If a resume target is missing, the result is clearly flagged: `⚠ resume miss — started fresh`.
