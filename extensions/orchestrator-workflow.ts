@@ -58,6 +58,8 @@ interface OrchestratorConfig {
   statusWidget?: boolean;
   statusView?: StatusView;
   replaceFooter?: boolean;
+  rexPanes?: boolean;
+  subagentEnvAllow?: string[];
 }
 
 interface AgentConfig {
@@ -285,6 +287,184 @@ function discoverAgentNames(): AgentName[] {
   return [...names].sort((a, b) => agentSortKey(a) - agentSortKey(b) || a.localeCompare(b));
 }
 
+// Tools a subagent gets when its frontmatter lists none: read-only, no shell.
+const DEFAULT_SAFE_TOOLS: readonly string[] = ["read", "grep", "find", "ls"];
+
+// Variables that look like credentials are not passed to subagents. Provider API keys
+// (*_API_KEY) stay so API-key auth keeps working; anything else can be re-allowed by
+// name with "subagentEnvAllow" in orchestrator-config.json.
+const SECRET_ENV_RE = /(TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_KEY|ACCESS_KEY|SESSION_KEY|COOKIE|AUTH)/i;
+const PROVIDER_KEY_ENV_RE = /_API_KEY$/;
+// REX_* would let a subagent find and drive the user's other Rex panes.
+const BLOCKED_ENV_NAMES = new Set(["SSH_AUTH_SOCK", "KUBECONFIG", "DOCKER_CONFIG", "NETRC", "REX_SERVER", "REX_SESSION", "REX_BLOCK"]);
+
+function subagentEnv(allow: readonly string[] = []): NodeJS.ProcessEnv {
+  const allowed = new Set(allow);
+  const env: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(process.env)) {
+    if (value === undefined) continue;
+    if (!allowed.has(name)) {
+      if (BLOCKED_ENV_NAMES.has(name)) continue;
+      if (SECRET_ENV_RE.test(name) && !PROVIDER_KEY_ENV_RE.test(name)) continue;
+    }
+    env[name] = value;
+  }
+  return env;
+}
+
+// A model-supplied cwd must stay inside the project the orchestrator runs in.
+function resolveProjectCwd(requested: unknown, projectCwd: string): string {
+  const baseReal = fs.realpathSync(projectCwd);
+  if (typeof requested !== "string" || requested.length === 0) return baseReal;
+  let real: string;
+  try {
+    real = fs.realpathSync(path.resolve(projectCwd, requested));
+  } catch {
+    throw new Error(`cwd does not exist: ${requested}`);
+  }
+  if (real !== baseReal && !real.startsWith(`${baseReal}${path.sep}`)) {
+    throw new Error(`cwd must be inside the project directory ${baseReal}; got ${real}.`);
+  }
+  return real;
+}
+
+const SENSITIVE_FILE_RE =
+  /(^|\/)(\.env(\.(?!example$|sample$|template$)[^/]*)?|\.netrc|\.npmrc|\.pypirc|id_(rsa|dsa|ecdsa|ed25519)[^/]*|[^/]*\.(pem|key|p12|pfx|kdbx|keystore|jks)|credentials(\.[^/]*)?|secrets?\.(json|ya?ml|toml|env))$/i;
+
+function isSensitiveFile(file: string): boolean {
+  return SENSITIVE_FILE_RE.test(file);
+}
+
+// Rex integration: when Pi runs inside a Rex terminal, each delegation gets a
+// background pane next to the user's that follows a readable log of its work.
+interface RexPane {
+  role: AgentName;
+  blockId: string;
+  done: boolean;
+}
+
+const rexPanes: RexPane[] = [];
+
+interface RexMirror {
+  write(text: string): void;
+  finish(summary: string): void;
+}
+
+const NOOP_REX_MIRROR: RexMirror = { write() {}, finish() {} };
+
+function rexLocation(): { session: string; block: string } | undefined {
+  const session = process.env.REX_SESSION;
+  const block = process.env.REX_BLOCK;
+  if (!session || !block) return undefined;
+  if (loadOrchestratorConfig().rexPanes === false) return undefined;
+  return { session, block };
+}
+
+function runRex(args: string[]): Promise<{ code: number; stdout: string }> {
+  return new Promise((resolve) => {
+    const proc = spawn("rex", args, { shell: false, stdio: ["ignore", "pipe", "ignore"] });
+    let stdout = "";
+    const timer = setTimeout(() => proc.kill("SIGKILL"), 10_000);
+    proc.stdout.on("data", (data) => {
+      stdout += data.toString();
+    });
+    proc.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({ code: code ?? 1, stdout });
+    });
+    proc.on("error", () => {
+      clearTimeout(timer);
+      resolve({ code: 1, stdout });
+    });
+  });
+}
+
+async function closeRexPanes(panes: RexPane[]) {
+  const session = process.env.REX_SESSION;
+  for (const pane of panes) {
+    const index = rexPanes.indexOf(pane);
+    if (index >= 0) rexPanes.splice(index, 1);
+  }
+  if (!session || panes.length === 0) return;
+  await runRex(["block", "close", "-s", session, ...panes.map((pane) => pane.blockId)]);
+}
+
+async function closeAllRexPanes() {
+  await closeRexPanes([...rexPanes]);
+}
+
+async function splitRexPane(session: string, anchor: string, direction: string, ratio: number, label: string, logPath: string) {
+  const result = await runRex([
+    "split",
+    "-s",
+    session,
+    "-b",
+    anchor,
+    "--split",
+    direction,
+    "--ratio",
+    String(ratio),
+    "--focus=false",
+    "--label",
+    label,
+    "--shell=none",
+    "--json",
+    "--",
+    "tail",
+    "-n",
+    "+1",
+    "-f",
+    logPath,
+  ]);
+  if (result.code !== 0) return undefined;
+  try {
+    const blockId = JSON.parse(result.stdout)?.block_ids?.[0];
+    return typeof blockId === "string" ? blockId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function startRexMirror(role: AgentName, label: string, sessionId: string, sessionDir: string, header: string): Promise<RexMirror> {
+  const location = rexLocation();
+  if (!location) return NOOP_REX_MIRROR;
+  try {
+    const logDir = path.join(sessionDir, "rex");
+    fs.mkdirSync(logDir, { recursive: true, mode: 0o700 });
+    const logPath = path.join(logDir, `${sessionId}.log`);
+    fs.appendFileSync(logPath, `${header}\n`, { mode: 0o600 });
+
+    // Replace this role's finished panes, then stack the new one under the newest
+    // remaining pane, or beside the user's pane when there is none.
+    await closeRexPanes(rexPanes.filter((pane) => pane.role === role && pane.done));
+    const newest = rexPanes[rexPanes.length - 1];
+    let blockId = newest ? await splitRexPane(location.session, newest.blockId, "below", 50, label, logPath) : undefined;
+    if (!blockId) {
+      if (newest) rexPanes.length = 0; // The user closed or moved our panes; start a fresh column.
+      blockId = await splitRexPane(location.session, location.block, "right", 40, label, logPath);
+    }
+    const pane: RexPane | undefined = blockId ? { role, blockId, done: false } : undefined;
+    if (pane) rexPanes.push(pane);
+
+    const write = (text: string) => {
+      try {
+        fs.appendFileSync(logPath, text.endsWith("\n") ? text : `${text}\n`);
+      } catch {
+        // The mirror is best effort and never fails a delegation.
+      }
+    };
+    return {
+      write,
+      finish(summary: string) {
+        write(`\n${summary}\n`);
+        if (pane) pane.done = true;
+      },
+    };
+  } catch {
+    return NOOP_REX_MIRROR;
+  }
+}
+
 function zeroUsageSnapshot(): UsageSnapshot {
   return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
 }
@@ -394,6 +574,10 @@ function normalizeOrchestratorConfig(value: any): OrchestratorConfig {
   if (typeof value.statusWidget === "boolean") config.statusWidget = value.statusWidget;
   if (isStatusView(value.statusView)) config.statusView = value.statusView;
   if (typeof value.replaceFooter === "boolean") config.replaceFooter = value.replaceFooter;
+  if (typeof value.rexPanes === "boolean") config.rexPanes = value.rexPanes;
+  if (Array.isArray(value.subagentEnvAllow)) {
+    config.subagentEnvAllow = value.subagentEnvAllow.filter((name: unknown): name is string => typeof name === "string" && name.length > 0);
+  }
   return config;
 }
 
@@ -419,6 +603,7 @@ function saveOrchestratorConfig(patch: Partial<OrchestratorConfig>): Orchestrato
   if (typeof patch.statusWidget === "boolean") next.statusWidget = patch.statusWidget;
   if (isStatusView(patch.statusView)) next.statusView = patch.statusView;
   if (typeof patch.replaceFooter === "boolean") next.replaceFooter = patch.replaceFooter;
+  if (typeof patch.rexPanes === "boolean") next.rexPanes = patch.rexPanes;
   fs.mkdirSync(path.dirname(getOrchestratorConfigPath()), { recursive: true });
   fs.writeFileSync(getOrchestratorConfigPath(), `${JSON.stringify(next, null, 2)}\n`, "utf8");
   return next;
@@ -433,7 +618,7 @@ provider: anthropic
 model: claude-sonnet-5
 thinking: medium
 execution: sequential
-tools: read,bash,grep,find,ls
+tools: read,grep,find,ls
 enabled: true
 ---
 
@@ -516,10 +701,11 @@ function loadAgent(name: AgentName): AgentConfig {
   const billingValue = frontmatter.billing?.trim();
   const billing = isBillingOverride(billingValue) ? billingValue : undefined;
   const enabled = frontmatter.enabled?.trim() !== "false";
-  const tools = (frontmatter.tools || "")
+  const listedTools = (frontmatter.tools || "")
     .split(",")
     .map((tool) => tool.trim())
     .filter(Boolean);
+  const tools = listedTools.length > 0 ? listedTools : [...DEFAULT_SAFE_TOOLS];
 
   if (!provider || !model) {
     throw new Error(`Agent ${name} must define provider and model in ${filePath}`);
@@ -867,6 +1053,14 @@ async function runDelegatedAgent(
     } as AgentToolResult<DelegationDetails>;
   }
 
+  // Transcripts can hold command output and secrets; keep them private to the user.
+  fs.mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
+  try {
+    fs.chmodSync(sessionDir, 0o700);
+  } catch {
+    // Not fatal on filesystems without POSIX modes.
+  }
+
   const sessionId = providedSessionId || randomUUID();
   const resumeSessionFile = providedSessionId ? findSubagentSessionFile(sessionDir, providedSessionId) : undefined;
   const resume: DelegationDetails["resume"] = providedSessionId ? (resumeSessionFile ? "resumed" : "not_found") : "new";
@@ -896,6 +1090,19 @@ async function runDelegatedAgent(
   args.push(`Task from orchestrator:\n\n${task}`);
 
   const invocation = getPiInvocation(args);
+  const mirror = await startRexMirror(
+    agentName,
+    agent.name,
+    sessionId,
+    sessionDir,
+    [
+      `━━ ${agent.name} · ${agent.provider}/${agent.model}:${effectiveThinking} · ${resume === "new" ? "new session" : `resume ${sessionId}`}`,
+      `cwd ${cwd}`,
+      "",
+      task,
+      "",
+    ].join("\n"),
+  );
   let stdoutBuffer = "";
   let stderr = "";
   let finalText = "";
@@ -1003,6 +1210,7 @@ async function runDelegatedAgent(
         summary: summarizeToolCall(toolName, toolArgs, cwd),
         pending: true,
       });
+      mirror.write(`→ ${summarizeToolCall(toolName, toolArgs, cwd)}`);
       emitUpdate(false);
     }
 
@@ -1027,6 +1235,7 @@ async function runDelegatedAgent(
       item.pending = false;
       item.isError = Boolean(event.isError);
       setActivityDetail(item, refined.detail);
+      if (item.isError) mirror.write(`✗ ${refined.summary}`);
       if (toolCallId) toolArgsById.delete(toolCallId);
       emitUpdate(true);
     }
@@ -1054,6 +1263,7 @@ async function runDelegatedAgent(
       if (text) {
         finalText = text;
         pushActivity({ kind: "text", summary: oneLine(text, 200) });
+        mirror.write(`\n${text}\n`);
       }
       if (event.message.stopReason) stopReason = event.message.stopReason;
       if (event.message.errorMessage) errorMessage = event.message.errorMessage;
@@ -1067,7 +1277,7 @@ async function runDelegatedAgent(
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
       env: {
-        ...process.env,
+        ...subagentEnv(loadOrchestratorConfig().subagentEnvAllow),
         PI_TELEMETRY: process.env.PI_TELEMETRY || "0",
         PI_SKIP_VERSION_CHECK: process.env.PI_SKIP_VERSION_CHECK || "1",
         PI_CACHE_RETENTION: process.env.PI_CACHE_RETENTION || "long",
@@ -1106,6 +1316,11 @@ async function runDelegatedAgent(
   });
 
   const failed = aborted || exitCode !== 0 || stopReason === "error" || Boolean(errorMessage);
+  mirror.finish(
+    failed
+      ? `■ ${agent.name} failed${aborted ? " (aborted)" : ""}: ${oneLine(errorMessage || stderr.trim() || `exit code ${exitCode}`, 300)}`
+      : `■ ${agent.name} done · ${turns} turn${turns === 1 ? "" : "s"} · ${formatCount(inputTokens)} in / ${formatCount(outputTokens)} out`,
+  );
   const fallback = errorMessage || stderr.trim() || (aborted ? `${agent.name} was aborted.` : "No output returned.");
   const resultText = finalText || fallback;
   const stderrTailBlock = failed && stderr.trim() ? `\n\nStderr (tail):\n\`\`\`\n${stderr.slice(-2000)}\n\`\`\`` : "";
@@ -2267,6 +2482,7 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
       `team ${isSystemEnabled(config) ? "on" : "off"}`,
       `status ${widget}`,
       `footer ${footer}`,
+      `rex panes ${config.rexPanes === false ? "off" : process.env.REX_SESSION ? "on" : "on (not in Rex)"}`,
       `orchestrator ${orchestratorProvider}/${orchestratorModel}:${orchestratorThinking} (prompt ${prompt})`,
       ...agentParts,
     ].join(" · ");
@@ -2294,12 +2510,21 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
         isError: true,
       } as AgentToolResult<DelegationDetails>;
     }
+    let cwd: string;
+    try {
+      cwd = resolveProjectCwd(params.cwd, ctx.cwd);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Cannot delegate to ${role}: ${error instanceof Error ? error.message : String(error)}` }],
+        isError: true,
+      } as AgentToolResult<DelegationDetails>;
+    }
     const run = async () => {
       throwIfAborted(signal);
       const result = await runDelegatedAgent(
         role,
         params.task,
-        params.cwd || ctx.cwd,
+        cwd,
         signal,
         onUpdate,
         (delta) => recordUsageDelta(role, delta, ctx),
@@ -2387,7 +2612,16 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       return runExclusive(async () => {
         throwIfAborted(signal);
-        const cwd = params.cwd || ctx.cwd;
+        let cwd: string;
+        try {
+          cwd = resolveProjectCwd(params.cwd, ctx.cwd);
+        } catch (error) {
+          return {
+            content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+            details: { cwd: String(params.cwd), status: "invalid_cwd" },
+            isError: true,
+          };
+        }
       const paths = Array.isArray(params.paths)
         ? params.paths.filter((pathspec: unknown): pathspec is string => typeof pathspec === "string" && pathspec.length > 0)
         : [];
@@ -2450,6 +2684,10 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
       if (diffableUntrackedFiles.length > 0) {
         const untrackedDiffSections: string[] = [];
         for (const file of diffableUntrackedFiles) {
+          if (isSensitiveFile(file)) {
+            untrackedDiffSections.push(`## ${file}\n\n(content omitted: the file looks like it holds secrets; add it to .gitignore if it should not be committed)`);
+            continue;
+          }
           const diff = await runGit(["diff", "--no-index", "--", "/dev/null", file], cwd);
           const diffOutput = diff.stdout || (diff.stderr ? `Stderr:\n${diff.stderr}` : "(no diff output)");
           untrackedDiffSections.push(`## ${file}\n\n${capOutput(diffOutput, 20_000, "Untracked file diff")}`);
@@ -2506,6 +2744,8 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
         ...STATUS_VIEWS,
         "prompt",
         "prompt reset",
+        "rex on",
+        "rex off",
         "add ",
         ...agentNames.flatMap((name) => [`enable ${name}`, `disable ${name}`]),
         ...agentNames.filter((name) => !isBuiltinAgent(name)).map((name) => `remove ${name}`),
@@ -2591,6 +2831,23 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
         }
         applySystemState(ctx);
         ctx.ui.notify(`${target} ${verb}d.`, "info");
+        return;
+      }
+      if (verb === "rex") {
+        if (target !== "on" && target !== "off") {
+          ctx.ui.notify(`Unknown /team rex argument: ${target || "(none)"} (use /team rex on or /team rex off)`, "error");
+          return;
+        }
+        config = saveOrchestratorConfig({ rexPanes: target === "on" });
+        if (target === "off") await closeAllRexPanes();
+        ctx.ui.notify(
+          target === "on"
+            ? process.env.REX_SESSION
+              ? "Delegations will open a live Rex pane beside this one."
+              : "Rex panes enabled; they appear when Pi runs inside a Rex terminal."
+            : "Rex panes disabled.",
+          "info",
+        );
         return;
       }
       if (action === "on") {
@@ -2681,5 +2938,6 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
     statusWidgetTimer = undefined;
     pendingStatusWidgetCtx = undefined;
     orchestratorUsageSnapshot = undefined;
+    await closeAllRexPanes();
   });
 }
