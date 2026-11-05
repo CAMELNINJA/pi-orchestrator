@@ -692,7 +692,13 @@ function loadAgent(name: AgentName): AgentConfig {
   const filePath = resolveAgentPath(name);
   if (!fs.existsSync(filePath)) throw new Error(`Agent ${name} not found at ${filePath}`);
   const content = fs.readFileSync(filePath, "utf8");
-  const { frontmatter, body } = parseFrontmatter<Record<string, string>>(content);
+  const parsed = parseFrontmatter<Record<string, unknown>>(content);
+  const body = parsed.body;
+  // YAML turns `enabled: false` into a boolean and bare numbers into numbers; read every value as text.
+  const frontmatter: Record<string, string | undefined> = {};
+  for (const [key, value] of Object.entries(parsed.frontmatter ?? {})) {
+    if (value !== null && value !== undefined) frontmatter[key] = String(value);
+  }
   const provider = frontmatter.provider?.trim();
   const model = frontmatter.model?.trim();
   const thinking = (frontmatter.thinking?.trim() || "medium") as ThinkingLevel;
