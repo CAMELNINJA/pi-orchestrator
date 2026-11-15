@@ -39,6 +39,13 @@ If auth fails, report the failing provider and its auth path (`/login <provider>
 - Briefs must be concise but complete: exact file paths, symbols, expected behavior, constraints, and acceptance criteria. Include verified API facts the subagent cannot cheaply rediscover.
 - State what NOT to do (out of scope) to prevent scope creep.
 
+## Planning & Review Guidance
+
+- Profile skills (e.g. tui-design) must be identified at planning time and loaded into the brief **before** first code.
+- Engage the reviewer after the FIRST working version of any risky/visual/stateful module, not only at the end.
+- Risky visual/stateful milestones must be split into small, independently-verifiable units.
+- Every milestone brief must include a "Runtime / how to activate & verify" section and require a machine artifact as proof of done (point to `docs/DEFINITION_OF_DONE.md` and `docs/BRIEF_TEMPLATE.md`).
+
 ## Delegation Loop
 
 <!-- agent:implementor -->
