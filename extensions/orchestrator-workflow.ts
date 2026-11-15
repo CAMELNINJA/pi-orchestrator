@@ -711,7 +711,7 @@ function usageSnapshotFromUsage(usage: any): UsageSnapshot {
   };
 }
 
-// Open dashboard in a new Rex window
+// Open dashboard as a split pane below the orchestrator's own Rex block (same tab)
 async function openDashboardWindow(sessionId: string): Promise<string | undefined> {
   try {
     // Resolve dashboard script path from extensionDir
@@ -737,7 +737,7 @@ async function openDashboardWindow(sessionId: string): Promise<string | undefine
       interpreter = "node";
     }
     
-    // Close previous dashboard window if exists
+    // Close previous dashboard pane if exists
     if (dashboardBlockId) {
       try {
         void runRex(["block", "close", "-s", location.session, dashboardBlockId]);
@@ -747,11 +747,20 @@ async function openDashboardWindow(sessionId: string): Promise<string | undefine
       dashboardBlockId = undefined;
     }
     
-    // Run dashboard script in new Rex window
+    // Split the orchestrator's pane instead of `rex run` (which opens a new tab)
     const result = await runRex([
-      "run",
+      "split",
       "-s",
       location.session,
+      "-b",
+      location.block,
+      "--split",
+      "below",
+      "--ratio",
+      "40",
+      "--focus=false",
+      "--label",
+      "dashboard",
       "--shell=none",
       "--json",
       "--",
@@ -3286,7 +3295,7 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("dashboard", {
-    description: "Open the orchestrator dashboard in a new Rex window",
+    description: "Open the orchestrator dashboard in a split pane below Pi (same Rex tab)",
     handler: async (_args, ctx) => {
       const sessionId = ctx.sessionManager?.getSessionId?.() || "";
       
@@ -3306,9 +3315,9 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
       // Open dashboard window
       const blockId = await openDashboardWindow(sessionId);
       if (blockId) {
-        ctx.ui.notify("Opened orchestrator dashboard in a new Rex window.", "info");
+        ctx.ui.notify("Opened orchestrator dashboard in a split pane below.", "info");
       } else {
-        ctx.ui.notify("Could not open the dashboard window.", "warning");
+        ctx.ui.notify("Could not open the dashboard pane.", "warning");
       }
     },
   });

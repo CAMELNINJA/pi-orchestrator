@@ -39,7 +39,7 @@ pi install npm:@redentor_dev/pi-orchestrator
 - `/team reset` — reset live status totals.
 - `/team rex on` / `/team rex off` — show or hide live Rex panes for delegations.
 - `/team minimal|default|detailed` — set the live status widget detail level.
-- `/dashboard` — open the live orchestrator dashboard in a new Rex window.
+- `/dashboard` — open the live orchestrator dashboard in a split pane below Pi (same Rex tab).
 
 Disabling with `/team off` deactivates the delegate/review tools and stops orchestrator system-prompt injection until re-enabled. The state persists as `enabled` in `~/.pi/agent/orchestrator-config.json`.
 
@@ -94,7 +94,7 @@ The dashboard records complexity as `trivial`, `normal`, or `complex`; risk as `
 
 The package includes a dependency-free Node TUI that visualizes the live orchestration. It shows the advisor (orchestrator) model and token/cost totals, the JEV fork layer with confidence bars, each subagent's role and model with running/done/error status, elapsed time and token/cost usage, a session log, and a status bar.
 
-Run `/dashboard` inside Pi to open the dashboard in a new Rex window. Pi must be running inside a Rex session; otherwise the command reports that Rex is required. Running `/dashboard` again replaces the previous dashboard window.
+Run `/dashboard` inside Pi to open the dashboard in a split pane below the Pi pane, in the same Rex tab. Pi must be running inside a Rex session; otherwise the command reports that Rex is required. Running `/dashboard` again replaces the previous dashboard pane.
 
 The extension writes live state as an atomic JSON file at `~/.pi/agent/orchestrator-dashboard/<sessionId>.json`. You can run the dashboard manually from any terminal with:
 
@@ -172,3 +172,26 @@ Releases:
 - npm publishing is configured for the public registry with public package access.
 - GitHub Actions publishes `v*` tags via npm Trusted Publishing (OIDC) with provenance. Actions are pinned to commit SHAs.
 - Maintainers: configure npm Trusted Publisher for GitHub Actions with repo `redentordev/pi-orchestrator`, workflow `publish.yml`, environment `npm-publish`.
+
+## Development
+
+### Running tests
+
+- **TUI validation**: `npm run test:frame` runs `assert-frame.mjs` to verify the dashboard renders correctly with color ON and boundary widths. Paste the machine artifact output when reporting done.
+- **Tree hygiene**: `npm run check:clean` checks for stray `package-lock.json` and reports `git status` (add `--strict` to fail on uncommitted changes).
+
+### Definition of Done
+
+Every task must pass the gates in `docs/DEFINITION_OF_DONE.md`:
+
+- Test reproduces the real path (color ON, boundary sizes, broken/empty input)
+- A machine artifact is attached (checker output, capture, diff—**not prose**)
+- Verified in the real environment (e.g. `rex block capture` for TUI)
+- Clean `git status` (no stray `package-lock.json`—run `npm run check:clean`)
+- Runtime activation documented (restart/cache needed? where artifact lives? how to confirm loaded?)
+- Independent review passed for key/risky parts
+- Async/error semantics (`await`/`void`/`try-finally`) described accurately
+
+### Brief template
+
+Use `docs/BRIEF_TEMPLATE.md` for delegation briefs. It enforces the above criteria and includes explicit sections for runtime/verification and machine artifact proof.

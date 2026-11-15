@@ -27,6 +27,15 @@ Your session may be resumed for follow-up tasks. When the task is marked as a fo
 - The task brief may include acceptance criteria. Before reporting done, check each criterion and state pass/fail in your report.
 - Do not perform final acceptance review. Return the result to the orchestrator.
 
+## Evidence & Validation
+
+- Never report "pass" without a pasted machine artifact (checker/test output, not prose).
+- Tests must exercise the real/vulnerable path, not just happy path (for TUI: color ON + boundary widths, e.g. `npm run test:frame`).
+- No `npm install` or out-of-scope refactors.
+- Leave `git status` clean: catch stray `package-lock.json` yourself (`npm run check:clean`).
+- Describe async/error semantics (`await`/`void`/`try-finally`) exactly as written, matching the code.
+- Grep for existing helpers before adding new ones.
+
 ## Output Budget
 
 Keep the report under ~80 lines; reference files and hunks, do not paste whole files.
