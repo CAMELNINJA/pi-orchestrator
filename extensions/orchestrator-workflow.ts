@@ -61,6 +61,8 @@ interface OrchestratorConfig {
   rexPanes?: boolean;
   subagentEnvAllow?: string[];
   subagentExtensions?: string[];
+  jev?: { enabled?: boolean; provider?: string; model?: string };
+  dashboard?: { autoOpen?: boolean };
 }
 
 interface AgentConfig {
@@ -402,6 +404,8 @@ async function closeAllRexPanes() {
 }
 
 async function splitRexPane(session: string, anchor: string, direction: string, ratio: number, label: string, logPath: string) {
+  const statusMsg = Buffer.from(label, "utf8").toString("base64");
+  const piStatus = `\x1b]7501;state=working:app=pi:msg=${statusMsg}\x1b\\`;
   const result = await runRex([
     "split",
     "-s",
@@ -418,10 +422,11 @@ async function splitRexPane(session: string, anchor: string, direction: string, 
     "--shell=none",
     "--json",
     "--",
-    "tail",
-    "-n",
-    "+1",
-    "-f",
+    "bash",
+    "-c",
+    'printf %s "$1"; exec tail -n +1 -f "$2"',
+    "bash",
+    piStatus,
     logPath,
   ]);
   if (result.code !== 0) return undefined;
@@ -477,6 +482,225 @@ function zeroUsageSnapshot(): UsageSnapshot {
   return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
 }
 
+// ===== Dashboard State Backbone =====
+
+interface DashboardAgentView {
+  role: string;
+  name: string;
+  provider: string;
+  model: string;
+  thinking: string;
+  status: "idle" | "running" | "done" | "error";
+  startedAt?: number;
+  finishedAt?: number;
+  usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number };
+  lastSummary?: string;
+}
+
+interface DashboardLogEntry {
+  at: number;
+  kind: string;
+  who: string;
+  text: string;
+}
+
+interface DashboardState {
+  version: 1;
+  updatedAt: number;
+  sessionId: string;
+  cwd: string;
+  orchestrator: { provider: string; model: string; thinking: string };
+  agents: DashboardAgentView[];
+  jev: {
+    enabled: boolean;
+    provider?: string;
+    model?: string;
+    forks: number;
+    lastDecisions: { at: number; agent: string; question: string; answer: string; confidence?: number }[];
+  };
+  log: DashboardLogEntry[];
+  totals: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number };
+}
+
+let dashboardState: DashboardState | undefined;
+let dashboardBlockId: string | undefined;
+
+function dashboardDir(): string {
+  return path.join(getAgentDir(), "orchestrator-dashboard");
+}
+
+function sanitizeSessionId(sessionId: string): string {
+  return sessionId.replace(/[^A-Za-z0-9._-]/g, "_") || "session";
+}
+
+function dashboardStatePath(sessionId: string): string {
+  return path.join(dashboardDir(), `${sanitizeSessionId(sessionId)}.json`);
+}
+
+let dashboardWriteTimer: any;
+
+function flushDashboardStateNow(): void {
+  try {
+    if (!dashboardState) return;
+    dashboardState.updatedAt = Date.now();
+    const statePath = dashboardStatePath(dashboardState.sessionId);
+    const tmpPath = `${statePath}.tmp`;
+    const json = `${JSON.stringify(dashboardState)}\n`;
+    fs.writeFileSync(tmpPath, json, { mode: 0o600 });
+    fs.renameSync(tmpPath, statePath);
+  } catch {
+    // Best effort - never break the system
+  }
+}
+
+function writeDashboardState(): void {
+  try {
+    if (dashboardWriteTimer) return;
+    dashboardWriteTimer = setTimeout(() => {
+      dashboardWriteTimer = undefined;
+      flushDashboardStateNow();
+    }, 150);
+  } catch {
+    // Best effort
+  }
+}
+
+function initDashboardState(sessionId: string, cwd: string, orchestrator: { provider: string; model: string; thinking: string }): void {
+  try {
+    const dir = dashboardDir();
+    try {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    } catch {
+      // Best effort
+    }
+    dashboardState = {
+      version: 1,
+      updatedAt: Date.now(),
+      sessionId,
+      cwd,
+      orchestrator: { provider: orchestrator.provider || "", model: orchestrator.model || "", thinking: orchestrator.thinking || "" },
+      agents: [],
+      jev: { enabled: false, forks: 0, lastDecisions: [] },
+      log: [],
+      totals: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+    };
+    flushDashboardStateNow();
+  } catch {
+    // Best effort - never break the system
+  }
+}
+
+function dashboardLog(kind: string, who: string, text: string): void {
+  try {
+    if (!dashboardState) return;
+    // Cap text size to prevent state file bloat
+    const cappedText = String(text ?? "").slice(0, 300);
+    const entry: DashboardLogEntry = { at: Date.now(), kind, who, text: cappedText };
+    dashboardState.log.push(entry);
+    // Cap log at newest 200 entries
+    if (dashboardState.log.length > 200) {
+      dashboardState.log = dashboardState.log.slice(-200);
+    }
+    writeDashboardState();
+  } catch {
+    // Best effort
+  }
+}
+
+function dashboardUpsertAgent(role: string, patch: Partial<DashboardAgentView>): void {
+  try {
+    if (!dashboardState) return;
+    let agent = dashboardState.agents.find((a) => a.role === role);
+    if (!agent) {
+      agent = {
+        role: patch.role || role,
+        name: patch.name || "",
+        provider: patch.provider || "",
+        model: patch.model || "",
+        thinking: patch.thinking || "",
+        status: patch.status || "idle",
+      };
+      dashboardState.agents.push(agent);
+    }
+    // Merge patch
+    if (patch.name !== undefined) agent.name = patch.name;
+    if (patch.provider !== undefined) agent.provider = patch.provider;
+    if (patch.model !== undefined) agent.model = patch.model;
+    if (patch.thinking !== undefined) agent.thinking = patch.thinking;
+    if (patch.status !== undefined) agent.status = patch.status;
+    if (patch.startedAt !== undefined) agent.startedAt = patch.startedAt;
+    if (patch.finishedAt !== undefined) agent.finishedAt = patch.finishedAt;
+    if (patch.usage !== undefined) agent.usage = patch.usage;
+    if (patch.lastSummary !== undefined) agent.lastSummary = patch.lastSummary;
+    writeDashboardState();
+  } catch {
+    // Best effort
+  }
+}
+
+function dashboardSetTotals(totals: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }): void {
+  try {
+    if (!dashboardState) return;
+    dashboardState.totals = { ...totals };
+    writeDashboardState();
+  } catch {
+    // Best effort
+  }
+}
+
+async function classifyTaskWithJev(ctx: any, agentName: string, taskText: string): Promise<void> {
+  try {
+    const cfg = loadOrchestratorConfig();
+    if (!cfg.jev?.enabled) return;
+    const provider = cfg.jev.provider || "openrouter";
+    const modelId = cfg.jev.model || "~typesafe/jev-latest";
+    const clf = ctx?.modelRegistry?.getModelOfType?.("classifier", provider, modelId);
+    if (!clf) {
+      dashboardLog("jev", agentName, `classifier ${provider}/${modelId} unavailable`);
+      return;
+    }
+    const task = (taskText || "").slice(0, 2000);
+    const res = await ctx.modelRegistry.classify(clf, {
+      state: { agent: agentName, task },
+      questions: {
+        complexity: { type: "score", instructions: "How complex is this coding/research task?", criteria: ["trivial or mechanical", "normal implementation", "complex or architectural"] },
+        risky: { type: "bool", instructions: "Is this change risky (touches public API, security, data, or many call sites)?", criteria: { true: "risky / wide blast radius", false: "contained / low risk" } },
+      },
+    });
+    if (!dashboardState) return;
+    if (res.stopReason !== "stop") {
+      dashboardLog("jev", agentName, `error: ${res.errorMessage || res.stopReason}`);
+      return;
+    }
+    dashboardState.jev.enabled = true;
+    dashboardState.jev.provider = provider;
+    dashboardState.jev.model = modelId;
+    const complexity = res.answers?.complexity;
+    const risky = res.answers?.risky;
+    const pushDecision = (question: string, answer: string, confidence?: number) => {
+      dashboardState!.jev.lastDecisions.push({ at: Date.now(), agent: agentName, question, answer, confidence });
+      if (dashboardState!.jev.lastDecisions.length > 20) dashboardState!.jev.lastDecisions = dashboardState!.jev.lastDecisions.slice(-20);
+      dashboardState!.jev.forks += 1;
+    };
+    const complexityLabels = ["trivial", "normal", "complex"];
+    let complexityText = "unknown";
+    if (complexity && complexity.type === "score") {
+      const idx = Math.max(0, Math.min(2, Math.round(complexity.score)));
+      complexityText = complexityLabels[idx];
+      pushDecision("complexity", complexityText, complexity.confidence);
+    }
+    let riskyText = "unknown";
+    if (risky && risky.type === "bool") {
+      riskyText = risky.probability >= 0.5 ? "risky" : "safe";
+      pushDecision("risky", riskyText, risky.probability);
+    }
+    dashboardLog("jev", agentName, `complexity=${complexityText} risk=${riskyText}`);
+    writeDashboardState();
+  } catch {
+    // Best effort — JEV must never break a delegation
+  }
+}
+
 function usageSnapshotFromUsage(usage: any): UsageSnapshot {
   return {
     input: safeNumber(usage?.input),
@@ -485,6 +709,76 @@ function usageSnapshotFromUsage(usage: any): UsageSnapshot {
     cacheWrite: safeNumber(usage?.cacheWrite),
     cost: safeNumber(usage?.cost?.total),
   };
+}
+
+// Open dashboard in a new Rex window
+async function openDashboardWindow(sessionId: string): Promise<string | undefined> {
+  try {
+    // Resolve dashboard script path from extensionDir
+    const dashboardScript = path.join(extensionDir, "..", "scripts", "orchestrator-dashboard.mjs");
+    
+    // Check if dashboard script exists
+    if (!fs.existsSync(dashboardScript)) {
+      return undefined;
+    }
+    
+    // Get state file path
+    const statePath = dashboardStatePath(sessionId);
+    
+    // Check Rex location
+    const location = rexLocation();
+    if (!location) {
+      return undefined;
+    }
+    
+    // Choose interpreter - use process.execPath if it contains "node", otherwise "node"
+    let interpreter = process.execPath;
+    if (!path.basename(interpreter).toLowerCase().includes("node")) {
+      interpreter = "node";
+    }
+    
+    // Close previous dashboard window if exists
+    if (dashboardBlockId) {
+      try {
+        void runRex(["block", "close", "-s", location.session, dashboardBlockId]);
+      } catch {
+        // Best effort
+      }
+      dashboardBlockId = undefined;
+    }
+    
+    // Run dashboard script in new Rex window
+    const result = await runRex([
+      "run",
+      "-s",
+      location.session,
+      "--shell=none",
+      "--json",
+      "--",
+      interpreter,
+      dashboardScript,
+      statePath,
+    ]);
+    
+    if (result.code !== 0) {
+      return undefined;
+    }
+    
+    // Parse JSON stdout
+    try {
+      const parsed = JSON.parse(result.stdout);
+      const blockId = parsed?.block_ids?.[0];
+      if (typeof blockId === "string") {
+        dashboardBlockId = blockId;
+        return blockId;
+      }
+    } catch {
+      // Ignore parse errors
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function usageDeltaFromSnapshots(
@@ -615,6 +909,8 @@ function saveOrchestratorConfig(patch: Partial<OrchestratorConfig>): Orchestrato
   if (isStatusView(patch.statusView)) next.statusView = patch.statusView;
   if (typeof patch.replaceFooter === "boolean") next.replaceFooter = patch.replaceFooter;
   if (typeof patch.rexPanes === "boolean") next.rexPanes = patch.rexPanes;
+  if (patch.jev !== undefined) next.jev = patch.jev;
+  if (patch.dashboard !== undefined) next.dashboard = patch.dashboard;
   fs.mkdirSync(path.dirname(getOrchestratorConfigPath()), { recursive: true });
   fs.writeFileSync(getOrchestratorConfigPath(), `${JSON.stringify(next, null, 2)}\n`, "utf8");
   return next;
@@ -1040,11 +1336,17 @@ async function runDelegatedAgent(
 ): Promise<AgentToolResult<DelegationDetails>> {
   const agent = loadAgent(agentName);
   const orchestratorConfig = loadOrchestratorConfig();
-  const sessionDir = path.join(getAgentDir(), "subagent-sessions");
   const effectiveThinking = thinkingOverride ?? agent.thinking;
+  
+  const sessionDir = path.join(getAgentDir(), "subagent-sessions");
 
   if (providedSessionId !== undefined && !/^[0-9a-zA-Z-]{8,64}$/.test(providedSessionId)) {
     const message = `Invalid sessionId: ${providedSessionId}. sessionId must match /^[0-9a-zA-Z-]{8,64}$/.`;
+    // Terminal write for early return
+    if (dashboardState) {
+      dashboardUpsertAgent(agentName, { role: agentName, status: "error", finishedAt: Date.now() });
+      dashboardLog("error", agentName, `session id validation: ${message}`);
+    }
     return {
       content: [{ type: "text", text: message }],
       details: {
@@ -1071,6 +1373,23 @@ async function runDelegatedAgent(
       isError: true,
     } as AgentToolResult<DelegationDetails>;
   }
+  
+  // Dashboard: delegation STARTS (after validation, before real work)
+  let dashboardEnded = false;
+  if (dashboardState) {
+    dashboardUpsertAgent(agentName, {
+      role: agentName,
+      name: agent.name,
+      provider: agent.provider,
+      model: agent.model,
+      thinking: effectiveThinking,
+      status: "running",
+      startedAt: Date.now(),
+    });
+    dashboardLog("delegate", agentName, `start ${agent.provider}/${agent.model}`);
+  }
+
+  try {
 
   // Transcripts can hold command output and secrets; keep them private to the user.
   fs.mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
@@ -1358,6 +1677,31 @@ async function runDelegatedAgent(
     ? `${resultWarning}${capOutput(resultText, Math.max(0, 32_000 - Buffer.byteLength(stderrTailBlock, "utf8") - Buffer.byteLength(resultWarning, "utf8")), "Delegation result")}${stderrTailBlock}`
     : `${resultWarning}${capOutput(resultText, Math.max(0, 32_000 - Buffer.byteLength(resultWarning, "utf8")), "Delegation result")}`;
 
+  // Dashboard: delegation ENDS
+  if (dashboardState && !dashboardEnded) {
+    dashboardEnded = true;
+    const finalUsage = { input: inputTokens, output: outputTokens, cacheRead: cacheReadTokens, cacheWrite: cacheWriteTokens, cost };
+    if (failed) {
+      dashboardUpsertAgent(agentName, {
+        role: agentName,
+        status: "error",
+        finishedAt: Date.now(),
+        usage: finalUsage,
+        lastSummary: errorMessage || stderr.trim() || (aborted ? `${agent.name} was aborted.` : "No output returned."),
+      });
+      dashboardLog("error", agentName, errorMessage || stderr.trim() || (aborted ? "aborted" : `exit code ${exitCode}`));
+    } else {
+      dashboardUpsertAgent(agentName, {
+        role: agentName,
+        status: "done",
+        finishedAt: Date.now(),
+        usage: finalUsage,
+        lastSummary: finalText ? finalText.slice(0, 120) : `Done in ${turns} turn${turns === 1 ? "" : "s"}`,
+      });
+      dashboardLog("done", agentName, "completed");
+    }
+  }
+
   return {
     content: [
       {
@@ -1368,6 +1712,12 @@ async function runDelegatedAgent(
     details: details(exitCode, failed ? "failed" : "done", finalText ? `${resultWarning}${finalText}` : undefined),
     isError: failed,
   } as AgentToolResult<DelegationDetails>;
+  } finally {
+    if (dashboardState && !dashboardEnded) {
+      dashboardUpsertAgent(agentName, { role: agentName, status: "error", finishedAt: Date.now() });
+      dashboardLog("error", agentName, "ended unexpectedly");
+    }
+  }
 }
 
 async function runGit(args: string[], cwd: string): Promise<{ code: number; stdout: string; stderr: string }> {
@@ -2101,6 +2451,24 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
   const recordUsageDelta = (role: Role, delta: UsageDelta, ctx: any, force = false) => {
     addUsageDeltaToTotals(totals, role, delta);
     refreshStatusWidget(ctx, force || Boolean(delta.requests));
+    // Dashboard: update totals
+    if (dashboardState) {
+      // Calculate totals for dashboard (orchestrator + all agents)
+      let dashboardInput = 0;
+      let dashboardOutput = 0;
+      let dashboardCacheRead = 0;
+      let dashboardCacheWrite = 0;
+      let dashboardCost = 0;
+      for (const roleKey of Object.keys(totals)) {
+        const t = totals[roleKey];
+        dashboardInput += t.input || 0;
+        dashboardOutput += t.output || 0;
+        dashboardCacheRead += t.cacheRead || 0;
+        dashboardCacheWrite += t.cacheWrite || 0;
+        dashboardCost += t.cost || 0;
+      }
+      dashboardSetTotals({ input: dashboardInput, output: dashboardOutput, cacheRead: dashboardCacheRead, cacheWrite: dashboardCacheWrite, cost: dashboardCost });
+    }
   };
 
   const rebuildTotalsFromSession = (ctx: any) => {
@@ -2545,6 +2913,8 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
         isError: true,
       } as AgentToolResult<DelegationDetails>;
     }
+    // JEV: classify task (advisory only, best effort)
+    void classifyTaskWithJev(ctx, role, params.task);
     const run = async () => {
       throwIfAborted(signal);
       const result = await runDelegatedAgent(
@@ -2915,6 +3285,34 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("dashboard", {
+    description: "Open the orchestrator dashboard in a new Rex window",
+    handler: async (_args, ctx) => {
+      const sessionId = ctx.sessionManager?.getSessionId?.() || "";
+      
+      // Check Rex location
+      const location = rexLocation();
+      if (!location) {
+        ctx.ui.notify("The dashboard needs Rex (run pi inside a Rex session).", "warning");
+        return;
+      }
+      
+      // Check session id
+      if (!sessionId) {
+        ctx.ui.notify("No session ID available. Try again later.", "warning");
+        return;
+      }
+      
+      // Open dashboard window
+      const blockId = await openDashboardWindow(sessionId);
+      if (blockId) {
+        ctx.ui.notify("Opened orchestrator dashboard in a new Rex window.", "info");
+      } else {
+        ctx.ui.notify("Could not open the dashboard window.", "warning");
+      }
+    },
+  });
+
   pi.on("before_agent_start", async (event) => {
     if (!isSystemEnabled(config)) return;
     const prompt = buildOrchestratorPrompt(agentNames);
@@ -2958,6 +3356,25 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
     rebuildTotalsFromSession(ctx);
     applySystemState(ctx);
     await applyConfiguredOrchestrator(ctx);
+    
+    // Dashboard: init on session start
+    const sid = ctx.sessionManager?.getSessionId?.() || "";
+    // Prefer live model, then config fallback; thinking from pi.getThinkingLevel() with config fallback
+    const provider = ctx.model?.provider || config.orchestrator?.provider || "";
+    const model = ctx.model?.id || config.orchestrator?.model || "";
+    const thinking = pi.getThinkingLevel() || config.orchestrator?.thinking || "";
+    if (sid) {
+      initDashboardState(sid, ctx.cwd || "", { provider, model, thinking });
+      dashboardLog("session", "orchestrator", "session start");
+    }
+    
+    // Auto-open dashboard on session start (if enabled and under Rex)
+    if (config.dashboard?.autoOpen === true && sid) {
+      const location = rexLocation();
+      if (location) {
+        void openDashboardWindow(sid);
+      }
+    }
   });
 
   pi.on("session_shutdown", async () => {
@@ -2965,6 +3382,12 @@ export default function orchestratorWorkflow(pi: ExtensionAPI) {
     statusWidgetTimer = undefined;
     pendingStatusWidgetCtx = undefined;
     orchestratorUsageSnapshot = undefined;
+    // Flush any pending dashboard state writes
+    if (dashboardWriteTimer) {
+      clearTimeout(dashboardWriteTimer);
+      dashboardWriteTimer = undefined;
+    }
+    flushDashboardStateNow();
     await closeAllRexPanes();
   });
 }

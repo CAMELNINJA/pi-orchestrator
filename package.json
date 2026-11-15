@@ -23,6 +23,9 @@
       "./extensions"
     ]
   },
+  "scripts": {
+    "dashboard": "node scripts/orchestrator-dashboard.mjs"
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-agent-core": "*",
@@ -33,6 +36,7 @@
     "extensions",
     "agents",
     "prompts",
+    "scripts",
     "README.md",
     "LICENSE"
   ],

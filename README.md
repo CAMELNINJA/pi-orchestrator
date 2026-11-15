@@ -11,6 +11,8 @@ It provides:
 - `delegate_design` for design/UI/UX review-and-fix passes after UI-affecting work.
 - Custom agents: any `~/.pi/agent/agents/<name>.md` becomes a `delegate_<name>` tool; scaffold one with `/team add <name>`.
 - `review_diff` for git status plus combined diff review.
+- An optional advisory JEV ("System One") decision layer that records task complexity and risk decisions without changing subagent routing.
+- A live orchestrator dashboard TUI with `/dashboard`, including advisor and subagent usage, JEV decisions, session logs, and status.
 - Per-agent enable/disable with a dynamic orchestrator system prompt that only describes the agents that are actually on.
 - An editable orchestrator prompt (`/team prompt`) that overrides the optimized bundled default; revert anytime with `/team prompt reset`.
 - `/team` for a persistent settings panel: grouped per-role enabled/provider/model/thinking/execution mode, orchestrator prompt mode, master on/off, status widget on/off, detail level, and footer mode.
@@ -37,6 +39,7 @@ pi install npm:@redentor_dev/pi-orchestrator
 - `/team reset` — reset live status totals.
 - `/team rex on` / `/team rex off` — show or hide live Rex panes for delegations.
 - `/team minimal|default|detailed` — set the live status widget detail level.
+- `/dashboard` — open the live orchestrator dashboard in a new Rex window.
 
 Disabling with `/team off` deactivates the delegate/review tools and stops orchestrator system-prompt injection until re-enabled. The state persists as `enabled` in `~/.pi/agent/orchestrator-config.json`.
 
@@ -69,6 +72,58 @@ When Pi runs inside a [Rex](https://www.superlogical.com/rex) terminal (`REX_SES
 - Panes close when Pi exits. `/team rex off` turns them off and closes them; the setting is `rexPanes` in `~/.pi/agent/orchestrator-config.json`.
 - Logs are kept at `~/.pi/agent/subagent-sessions/rex/<session id>.log`, readable only by you.
 - The `rex` command must be on `PATH`. Outside Rex, or if `rex` fails, delegations run exactly as before.
+- Mirrored subagent panes emit Rex's Pi Program Status automatically, so Rex shows the Pi logo on the subagent block instead of a generic shell icon.
+
+## JEV decision layer
+
+The optional JEV (also called "System One") layer consults a classifier model on each delegation to assess task complexity and risk. It is **advisory only**: the decisions are recorded for the dashboard, but they do not change which model or agent a subagent uses.
+
+Enable it in `~/.pi/agent/orchestrator-config.json`:
+
+```json
+{
+  "jev": { "enabled": true, "provider": "openrouter", "model": "~typesafe/jev-latest" }
+}
+```
+
+When enabled, the default provider is `openrouter` and the default model is `~typesafe/jev-latest`. The feature is disabled by default; omit `jev` or set `"enabled": false`. The selected model must be a classifier available through your configured credentials (for example, OpenRouter). Classifier models do not appear in `/model`.
+
+The dashboard records complexity as `trivial`, `normal`, or `complex`; risk as `safe` or `risky`; and the confidence for each decision. A running fork count is shown alongside the decisions.
+
+## Live orchestrator dashboard
+
+The package includes a dependency-free Node TUI that visualizes the live orchestration. It shows the advisor (orchestrator) model and token/cost totals, the JEV fork layer with confidence bars, each subagent's role and model with running/done/error status, elapsed time and token/cost usage, a session log, and a status bar.
+
+Run `/dashboard` inside Pi to open the dashboard in a new Rex window. Pi must be running inside a Rex session; otherwise the command reports that Rex is required. Running `/dashboard` again replaces the previous dashboard window.
+
+The extension writes live state as an atomic JSON file at `~/.pi/agent/orchestrator-dashboard/<sessionId>.json`. You can run the dashboard manually from any terminal with:
+
+```bash
+node scripts/orchestrator-dashboard.mjs <path-to-state-file>
+```
+
+Or use the package's npm script:
+
+```bash
+npm run dashboard -- <state-file>
+```
+
+Quit with `q` or `Ctrl+C`. The dashboard uses the alternate screen and restores the terminal on exit, honors `NO_COLOR`, and supports `DASH_ASCII=1` to force ASCII rendering for legacy terminals. The layout is responsive and shows a "terminal too small" state below approximately 50x14.
+
+To open the dashboard automatically on session start when running under Rex, enable it in `~/.pi/agent/orchestrator-config.json`:
+
+```json
+{
+  "dashboard": { "autoOpen": true }
+}
+```
+
+## Configuration
+
+Persistent settings live in `~/.pi/agent/orchestrator-config.json`. Alongside the `orchestrator`, `rexPanes`, and `statusWidget` settings, the package supports:
+
+- `jev`: `{ "enabled": true, "provider": "openrouter", "model": "~typesafe/jev-latest" }` for the advisory classifier layer. Disabled by default.
+- `dashboard`: `{ "autoOpen": true }` to open the dashboard automatically on session start under Rex.
 
 ## Extensions in subagents
 
